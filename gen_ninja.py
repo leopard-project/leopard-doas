@@ -18,7 +18,7 @@ CRT_LIBS = [LIB / "libxact.a", LIB / "liballoc.a"]
 
 PKG = {
     "pkgname": "leopard-doas",
-    "pkgver":  "1.0_1",
+    "pkgver":  "1.0_2",
     "arch":    "x86_64",
     "desc":    "Leopard privilege elevation (OpenBSD doas style)",
     "deps":    "leopard-base>=1.0_1",

@@ -9,6 +9,12 @@
  *
  * Config: /system/config/doas.conf, falling back to /config/doas.conf.
  * If no file exists, Admin users are permitted.  Root never needs a password.
+ * The config must be owned by uid 0 and not group/world writable; anything
+ * else is refused outright instead of falling back to the default.
+ *
+ * The target command never inherits the caller's environment.  Only a small
+ * whitelist of display/locale variables survives; PATH, USER, LOGNAME and
+ * HOME are replaced with fixed values.
  */
 #include "xtuiapi.h"
 #include "libsys.h"
@@ -20,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define SXAH_CHECK_USER_PASSWORD 128956723895689203ULL
@@ -41,6 +48,20 @@
 #define CONFIG_PATH_LIVE   "/config/doas.conf"
 #define PATH_CAP           512
 #define LINE_CAP           256
+
+/* Safe search path; also the PATH exported to the target command. */
+#define SAFE_PATH "/apps/system:/apps/leopard:/apps/builtin:/system/leopard"
+
+#define CONFIG_MISSING  (-1)
+#define CONFIG_INSECURE (-2)
+
+/* Hard cap on the child environment; no unbounded growth. */
+#define ENV_CAP   32
+#define ENV_ARENA 4096
+
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
 
 struct doas_termios {
         uint32_t c_iflag;
@@ -102,36 +123,73 @@ static void wipe(char *buffer, size_t length)
         while (length-- > 0) buffer[length] = '\0';
 }
 
-/* Read one config file into memory; returns length or -1. */
+/*
+ * Read one config file into memory.
+ *
+ * Returns the length on success, CONFIG_MISSING if the file does not exist,
+ * or CONFIG_INSECURE if it cannot be trusted.  The ownership/mode check is
+ * done with fstat() on the descriptor we actually read, so the path cannot be
+ * swapped between check and read.  O_NOFOLLOW is honoured where the libc and
+ * kernel support it; fstat() still validates whatever was opened.
+ */
 static int read_config(const char *path, char *buffer, size_t capacity)
 {
+        struct stat st;
         int     fd;
         ssize_t got;
 
-        if (path == NULL || buffer == NULL || capacity == 0) return -1;
-        fd = open(path, O_RDONLY);
-        if (fd < 0) return -1;
+        if (path == NULL || buffer == NULL || capacity == 0)
+                return CONFIG_MISSING;
+
+        fd = open(path, O_RDONLY | O_NOFOLLOW);
+        if (fd < 0) {
+                /* Only a genuinely absent config may fall through to the
+                 * default; any other open failure is a hard error. */
+                if (errno == ENOENT || errno == ENOTDIR)
+                        return CONFIG_MISSING;
+                return CONFIG_INSECURE;
+        }
+
+        if (fstat(fd, &st) != 0 ||
+            st.st_uid != 0 ||
+            (st.st_mode & 022) != 0 ||
+            !S_ISREG(st.st_mode)) {
+                close(fd);
+                return CONFIG_INSECURE;
+        }
+
         got = read(fd, buffer, capacity - 1);
         close(fd);
-        if (got < 0) return -1;
+        if (got < 0) return CONFIG_INSECURE;
         buffer[got] = '\0';
         return (int)got;
 }
 
-/* Returns 1 if the caller is permitted, 0 otherwise. */
-static int config_permits(const char *name, UserType type)
+/*
+ * Load the first available config.  Returns its length, CONFIG_MISSING when
+ * neither path exists, or CONFIG_INSECURE when a file exists but fails the
+ * ownership/mode check.  An insecure system config never falls back to the
+ * live path.
+ */
+static int load_config(char *buffer, size_t capacity)
 {
-        char buffer[4096];
-        int  got;
+        int got;
 
+        got = read_config(CONFIG_PATH_SYSTEM, buffer, capacity);
+        if (got != CONFIG_MISSING) return got;
+        return read_config(CONFIG_PATH_LIVE, buffer, capacity);
+}
+
+/*
+ * Returns 1 if the caller is permitted, 0 if denied.  An absent config keeps
+ * the Admin-only default; CONFIG_INSECURE is handled by the caller before
+ * this point and denies everything.
+ */
+static int config_permits(const char *name, UserType type, char *buffer, int got)
+{
+        if (buffer == NULL || got < 0)
+                return got == CONFIG_MISSING ? type == XUT_Admin : 0;
         if (name == NULL) return 0;
-
-        got = read_config(CONFIG_PATH_SYSTEM, buffer, sizeof(buffer));
-        if (got < 0) got = read_config(CONFIG_PATH_LIVE, buffer, sizeof(buffer));
-        if (got < 0) {
-                /* No config: the default is Admin-only. */
-                return type == XUT_Admin;
-        }
 
         char *line = buffer;
         while (*line != '\0') {
@@ -165,6 +223,77 @@ static int config_permits(const char *name, UserType type)
         return 0;
 }
 
+/*
+ * Fixed-capacity child environment.  Strings are copied into a fixed arena;
+ * no caller pointer is ever passed to execve() and no unbounded allocation is
+ * performed.
+ */
+struct child_env {
+        char  *vec[ENV_CAP + 1];
+        char   data[ENV_ARENA];
+        size_t used;
+        size_t count;
+};
+
+static int env_name_is(const char *entry, const char *name)
+{
+        size_t len = strlen(name);
+
+        return strncmp(entry, name, len) == 0 && entry[len] == '=';
+}
+
+/* Only display and locale variables survive from the caller's environment. */
+static int env_allowed(const char *entry)
+{
+        static const char *const keep[] = {
+                "TERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+                "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "COLORTERM", NULL
+        };
+
+        if (entry == NULL) return 0;
+        for (int i = 0; keep[i] != NULL; i++)
+                if (env_name_is(entry, keep[i])) return 1;
+        return 0;
+}
+
+static int env_push(struct child_env *env, const char *entry)
+{
+        size_t len;
+
+        if (entry == NULL || env->count >= ENV_CAP) return -1;
+        len = strlen(entry);
+        if (env->used + len + 1 > sizeof(env->data)) return -1;
+
+        memcpy(env->data + env->used, entry, len + 1);
+        env->vec[env->count++] = env->data + env->used;
+        env->used += len + 1;
+        env->vec[env->count] = NULL;
+        return 0;
+}
+
+static int build_env(struct child_env *env, char *const caller_envp[])
+{
+        static const char *const fixed[] = {
+                "PATH=" SAFE_PATH,
+                "USER=root",
+                "LOGNAME=root",
+                "HOME=/",
+                NULL
+        };
+
+        memset(env, 0, sizeof(*env));
+        for (int i = 0; fixed[i] != NULL; i++)
+                if (env_push(env, fixed[i]) != 0) return -1;
+
+        /* LD_*, IFS, ENV, BASH_ENV, SHELL, PWD, OLDPWD and everything else
+         * are dropped: they are not on the whitelist above. */
+        for (size_t i = 0; caller_envp != NULL && caller_envp[i] != NULL; i++) {
+                if (!env_allowed(caller_envp[i])) continue;
+                (void)env_push(env, caller_envp[i]);
+        }
+        return 0;
+}
+
 static int find_command(const char *name, char *out, size_t cap)
 {
         static const char *const dirs[] = {
@@ -181,25 +310,12 @@ static int find_command(const char *name, char *out, size_t cap)
                 return -1;
         }
 
+        /* Search only the fixed safe directories; never the caller's PATH. */
         for (int i = 0; dirs[i] != NULL; i++) {
                 snprintf(out, cap, "%s/%s", dirs[i], name);
                 if (access(out, X_OK) == 0) return 0;
                 snprintf(out, cap, "%s/%s.elf", dirs[i], name);
                 if (access(out, X_OK) == 0) return 0;
-        }
-
-        const char *path = getenv("PATH");
-        while (path != NULL && *path != '\0') {
-                const char *colon = strchr(path, ':');
-                size_t      len = colon != NULL ? (size_t)(colon - path) : strlen(path);
-                if (len > 0 && len + strlen(name) + 2 < cap) {
-                        memcpy(out, path, len);
-                        out[len] = '/';
-                        strcpy(out + len + 1, name);
-                        if (access(out, X_OK) == 0) return 0;
-                }
-                if (colon == NULL) break;
-                path = colon + 1;
         }
         return -1;
 }
@@ -207,6 +323,9 @@ static int find_command(const char *name, char *out, size_t cap)
 int main(int argc, char *argv[], char *envp[])
 {
         UserInfo current;
+        struct child_env env;
+        char     config[4096];
+        int      config_len;
         int      command_index = 1;
 
         if (argc < 2) {
@@ -232,8 +351,18 @@ int main(int argc, char *argv[], char *envp[])
         memset(&current, 0, sizeof(current));
         xapi_GetCurrentUser(&current);
 
+        /* Fail closed for every caller, root included: a config that exists
+         * but is not owned by uid 0 or is group/world-writable denies all
+         * requests. */
+        config_len = load_config(config, sizeof(config));
+        if (config_len == CONFIG_INSECURE) {
+                out_fd(2, "doas: insecure config file\n");
+                return 1;
+        }
+
         if (current.user_type != XUT_Root) {
-                if (!config_permits(current.name, current.user_type)) {
+                if (!config_permits(current.name, current.user_type,
+                                    config, config_len)) {
                         out_fd(2, "doas: permission denied\n");
                         return 1;
                 }
@@ -268,7 +397,12 @@ int main(int argc, char *argv[], char *envp[])
                 return 1;
         }
 
-        execve(path, &argv[command_index], envp);
+        if (build_env(&env, envp) != 0) {
+                out_fd(2, "doas: cannot build a safe environment\n");
+                return 1;
+        }
+
+        execve(path, &argv[command_index], env.vec);
         out_fd(2, "doas: cannot execute command\n");
         return 1;
 }
