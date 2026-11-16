@@ -47,7 +47,6 @@
 #define CONFIG_PATH_SYSTEM "/system/config/doas.conf"
 #define CONFIG_PATH_LIVE   "/config/doas.conf"
 #define PATH_CAP           512
-#define LINE_CAP           256
 
 /* Safe search path; also the PATH exported to the target command. */
 #define SAFE_PATH "/apps/system:/apps/leopard:/apps/builtin:/system/leopard"
